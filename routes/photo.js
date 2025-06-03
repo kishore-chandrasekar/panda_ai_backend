@@ -13,7 +13,7 @@ const upload = multer({ storage });
 router.get('/', photoController.getPhotos);
 router.post('/', upload.array('photos', 10), photoController.uploadPhotos);
 router.patch('/:id', photoController.updatePhoto);
-router.get('/:id', photoController.getPhotos);
+router.get('/:id', photoController.getPhotoById);
 router.patch('/movetotrash/:id', photoController.softDeletePhoto);
 router.patch('/restore/:id', photoController.restorePhoto);
 router.delete('/:id', photoController.hardDeletePhoto);

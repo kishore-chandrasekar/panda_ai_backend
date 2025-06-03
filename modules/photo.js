@@ -4,66 +4,157 @@ const mongoose = require('mongoose');
 
 
 
-exports.getPhotos = async (req, res, next) => {
+exports.getPhotos = async (req, res) => {
     try {
-        const data = await Photo.find();
-        res.send(data);
+        const data = await Photo.aggregate([
+            {
+                $lookup: {
+                    from: 'tags',
+                    localField: '_id',
+                    foreignField: 'photoId',
+                    as: 'tags'
+                }
+            },
+            {
+                $project: {
+                    photoName: 1,
+                    description: 1,
+                    metadata: 1,
+                    favorite: 1,
+                    isDeleted: 1,
+                    filePath: 1,
+                    uploadedAt: 1,
+                    AlbumName: 1,
+                    tags: '$tags.value'
+                }
+            }
+        ]);
+
+        res.status(200).json(data);
     } catch (err) {
-        res.status(500).send(err);
+        console.error('Error fetching photos:', err);
+        res.status(500).json({ message: 'Internal server error', error: err.message });
     }
 };
 
-exports.uploadPhotos = async (req, res, next) => {
+
+
+
+exports.uploadPhotos = async (req, res) => {
     try {
         const files = req.files;
-        const { title, description, tags, imageId } = req.body;
+        const { title, description, tags } = req.body;
 
         if (!files || files.length === 0) {
-            return res.status(400).send({ message: 'No files uploaded' });
+            return res.status(400).json({ message: 'No files uploaded' });
         }
 
-        const parsedTags = JSON.parse(tags);
+        let parsedTags = [];
+        try {
+            parsedTags = typeof tags === 'string' ? JSON.parse(tags) : tags;
+        } catch (error) {
+            return res.status(400).json({ message: 'Invalid tags format' });
+        }
 
+        const savedPhotos = [];
+        const allTagDocs = [];
 
-        const savedPhotos = await Promise.all(
-            files.map(async (file) => {
-                const newPhoto = new Photo({
-                    photoName: file.originalname,
-                    filePath: file.path.replace(/\\/g, '/'),
-                    metadata: title || '',
-                    description: description || ''
+        for (const file of files) {
+            const photo = new Photo({
+                photoName: file.originalname,
+                filePath: file.path.replace(/\\/g, '/'),
+                metadata: title || '',
+                description: description || '',
+            });
+
+            const savedPhoto = await photo.save();
+            savedPhotos.push(savedPhoto);
+
+            if (Array.isArray(parsedTags) && parsedTags.length > 0) {
+                parsedTags.forEach(tag => {
+                    allTagDocs.push({ photoId: savedPhoto._id, value: tag });
                 });
+            }
+        }
 
-                const photoDoc = await newPhoto.save();
+        if (allTagDocs.length > 0) {
+            await Tags.insertMany(allTagDocs);
+        }
 
-                const finalImageId = imageId?.length > 0 ? imageId : photoDoc._id
+        return res.status(201).json({ message: 'Photos uploaded successfully', photos: savedPhotos });
+    } catch (err) {
+        console.error('Upload error:', err);
+        return res.status(500).json({ message: 'Internal server error', error: err.message });
+    }
+};
 
-                if (parsedTags && parsedTags.length > 0) {
-                    const tagDocs = parsedTags.map(value => ({ photoId: finalImageId, value }));
-                    await Tags.insertMany(tagDocs);
-                }
 
-                return photoDoc;
-            })
+exports.updatePhoto = async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const photoId = req.params.id;
+
+        if (!mongoose.Types.ObjectId.isValid(photoId)) {
+            return res.status(400).json({ message: 'Invalid photo ID' });
+        }
+
+        const allowedFields = [
+            'photoName',
+            'description',
+            'metadata',
+            'favorite',
+            'isDeleted',
+            'AlbumName',
+        ];
+
+        const updateData = {};
+        for (const key of allowedFields) {
+            if (req.body[key] !== undefined) {
+                updateData[key] = req.body[key];
+            }
+        }
+
+        const updatedPhoto = await Photo.findByIdAndUpdate(
+            photoId,
+            { $set: updateData },
+            { new: true, session }
         );
 
-        res.status(201).send(savedPhotos);
+        if (!updatedPhoto) {
+            await session.abortTransaction();
+            return res.status(404).json({ message: 'Photo not found' });
+        }
+
+        if (Array.isArray(req.body.tags)) {
+            await Tags.deleteMany({ photoId: new mongoose.Types.ObjectId(photoId) }).session(session);
+
+            const newTags = req.body.tags.map(value => ({
+                photoId: new mongoose.Types.ObjectId(photoId),
+                value
+            }));
+
+            if (newTags.length > 0) {
+                await Tags.insertMany(newTags, { session });
+            }
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+
+        res.status(200).json({
+            message: 'Photo updated successfully',
+            data: updatedPhoto
+        });
     } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: 'Internal server error', error: err.message });
+        await session.abortTransaction();
+        session.endSession();
+        console.error('Error updating photo:', err);
+        res.status(500).json({ message: 'Internal server error', error: err.message });
     }
 };
 
-
-exports.updatePhoto = async (req, res, next) => {
-    try {
-        const updated = await Photo.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        if (!updated) return res.status(404).send({ message: 'Photo not found' });
-        res.status(201).send(updated);
-    } catch (err) {
-        res.status(500).send(err);
-    }
-};
 
 
 
@@ -148,15 +239,46 @@ exports.deleteAlbum = async (req, res) => {
 
 
 
-exports.getPhotoById = async (req, res, next) => {
+exports.getPhotoById = async (req, res) => {
     try {
-        const photo = await Photo.findById(req.params.id);
-        if (!photo) return res.status(404).send({ message: 'Photo not found' });
-        res.send(photo);
+        const photoId = req.params.id;
+
+        const data = await Photo.aggregate([
+            { $match: { _id: new mongoose.Types.ObjectId(photoId) } },
+            {
+                $lookup: {
+                    from: 'tags',
+                    localField: '_id',
+                    foreignField: 'photoId',
+                    as: 'tags'
+                }
+            },
+            {
+                $project: {
+                    photoName: 1,
+                    description: 1,
+                    metadata: 1,
+                    favorite: 1,
+                    isDeleted: 1,
+                    filePath: 1,
+                    uploadedAt: 1,
+                    AlbumName: 1,
+                    tags: '$tags.value'
+                }
+            }
+        ]);
+
+        if (!data || data.length === 0) {
+            return res.status(404).json({ message: 'Photo not found' });
+        }
+
+        res.status(200).json(data[0]);
     } catch (err) {
-        res.status(500).send(err);
+        console.error('Error fetching photo by ID:', err);
+        res.status(500).json({ message: 'Internal server error', error: err.message });
     }
 };
+
 
 exports.softDeletePhoto = async (req, res, next) => {
     try {
@@ -197,20 +319,28 @@ exports.restorePhoto = async (req, res, next) => {
 
 
 
-exports.hardDeletePhoto = async (req, res, next) => {
+exports.hardDeletePhoto = async (req, res) => {
     try {
-        const photo = await Photo.findByIdAndDelete(req.params.id);
+        const photoId = req.params.id;
 
-        if (!photo) {
-            return res.status(404).send({ message: 'Photo not found' });
+        if (!mongoose.Types.ObjectId.isValid(photoId)) {
+            return res.status(400).json({ message: 'Invalid photo ID' });
         }
 
-        await Tags.deleteMany({ photoId: req.params.id });
+        const deletedPhoto = await Photo.findByIdAndDelete(photoId);
+        if (!deletedPhoto) {
+            return res.status(404).json({ message: 'Photo not found' });
+        }
 
-        res.status(200).send({ message: 'Photo and associated tags permanently deleted', data: photo });
+        await Tags.deleteMany({ photoId: new mongoose.Types.ObjectId(photoId) });
+
+        res.status(200).json({
+            message: 'Photo and associated tags permanently deleted',
+            data: deletedPhoto
+        });
     } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: 'Internal server error', error: err.message });
+        console.error('Error in hardDeletePhoto:', err);
+        res.status(500).json({ message: 'Internal server error', error: err.message });
     }
 };
 
